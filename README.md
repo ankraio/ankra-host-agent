@@ -30,4 +30,6 @@ Each release carries:
 - `SHA256SUMS`
 
 This repository holds releases only. The source is developed in Ankra's agent repository and published here by its
-release pipeline.
+release pipeline: it pushes the assets on a short-lived `release-assets/v<version>` branch together with the tag
+`v<version>`, and this repository's [publish workflow](.github/workflows/publish-release.yml) verifies them against
+`SHA256SUMS`, creates the release and deletes the branch.

@@ -1,0 +1,115 @@
+# Publishes a GitHub release of ankra-host-agent when Ankra's agent pipeline
+# pushes a release tag here.
+#
+# The agent repository is private and builds the binaries. Its Build & Deploy
+# job (`release-host-agent`, deploy/host-agent/push-release-assets.sh) holds a
+# write deploy key for this repository and nothing else, and a deploy key can
+# push git refs but cannot create a release. So it pushes, in one atomic push:
+#
+#   refs/heads/release-assets/v<version>  an orphan commit holding exactly the
+#                                         four release assets
+#   refs/tags/v<version>                  on this repository's main, which is
+#                                         where this workflow runs from
+#
+# This workflow then verifies the assets against SHA256SUMS, creates the
+# release for the tag with this repository's own GITHUB_TOKEN, and deletes the
+# asset branch so the binaries do not stay in the git history. If it fails,
+# the branch is kept: fix the cause and re-run this workflow run.
+name: Publish release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPOSITORY: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      ASSET_BRANCH: release-assets/${{ github.ref_name }}
+    steps:
+      - name: Check the tag
+        run: |
+          if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::${TAG} is not a release tag v<major>.<minor>.<patch>"
+            exit 1
+          fi
+
+      - name: Fetch the release assets
+        run: |
+          git init -q assets
+          cd assets
+          git remote add origin "https://github.com/${REPOSITORY}.git"
+          if ! git fetch -q --depth 1 origin "refs/heads/${ASSET_BRANCH}"; then
+            echo "::error::branch ${ASSET_BRANCH} does not exist, so ${TAG} has no assets to publish. The agent pipeline pushes it together with the tag."
+            exit 1
+          fi
+          git checkout -q FETCH_HEAD
+          rm -rf .git
+
+      - name: Verify the release assets
+        working-directory: assets
+        run: |
+          expected="$(printf '%s\n' SHA256SUMS ankra-host-agent-linux-amd64 ankra-host-agent-linux-arm64 ankra-host-agent.service | LC_ALL=C sort)"
+          actual="$(find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort)"
+          if [ "${actual}" != "${expected}" ]; then
+            echo "::error::${ASSET_BRANCH} must hold exactly the four release assets, it holds:"
+            echo "${actual}"
+            exit 1
+          fi
+          listed="$(awk '{print $2}' SHA256SUMS | LC_ALL=C sort)"
+          if [ "${listed}" != "$(printf '%s\n' ankra-host-agent-linux-amd64 ankra-host-agent-linux-arm64 ankra-host-agent.service | LC_ALL=C sort)" ]; then
+            echo "::error::SHA256SUMS must list the two binaries and the unit file, it lists: ${listed}"
+            exit 1
+          fi
+          sha256sum --strict -c SHA256SUMS
+
+      - name: Create or update the release
+        working-directory: assets
+        run: |
+          version="${TAG#v}"
+          latest_flag="--latest"
+          latest_tag="$(gh release view --repo "${REPOSITORY}" --json tagName --jq .tagName 2> /dev/null || true)"
+          if [ -n "${latest_tag}" ] && [ "${latest_tag}" != "${TAG}" ]; then
+            highest_tag="$(printf '%s\n%s\n' "${latest_tag}" "${TAG}" | sort -V | tail -n 1)"
+            if [ "${highest_tag}" != "${TAG}" ]; then
+              latest_flag="--latest=false"
+            fi
+          fi
+          assets=(ankra-host-agent-linux-amd64 ankra-host-agent-linux-arm64 ankra-host-agent.service SHA256SUMS)
+          if gh release view "${TAG}" --repo "${REPOSITORY}" --json tagName > /dev/null 2>&1; then
+            echo "Release ${TAG} already exists; replacing its assets."
+            gh release upload "${TAG}" "${assets[@]}" --repo "${REPOSITORY}" --clobber
+            gh release edit "${TAG}" --repo "${REPOSITORY}" --draft=false "${latest_flag}"
+          else
+            gh release create "${TAG}" "${assets[@]}" --repo "${REPOSITORY}" --verify-tag \
+              --title "ankra-host-agent ${version}" \
+              --notes "ankra-host-agent ${version}. Install it on a host with \`ankra targets register\`, which verifies the download against SHA256SUMS." \
+              "${latest_flag}"
+          fi
+          echo "Published https://github.com/${REPOSITORY}/releases/tag/${TAG} (${latest_flag})" | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      - name: Check the published checksums
+        working-directory: assets
+        run: |
+          published="$(gh release download "${TAG}" --repo "${REPOSITORY}" --pattern SHA256SUMS --output -)"
+          if [ "${published}" != "$(cat SHA256SUMS)" ]; then
+            echo "::error::the SHA256SUMS published on ${TAG} differs from the one on ${ASSET_BRANCH}"
+            exit 1
+          fi
+
+      - name: Delete the asset branch
+        run: gh api --method DELETE "repos/${REPOSITORY}/git/refs/heads/${ASSET_BRANCH}"
